@@ -8,7 +8,15 @@ const IN_YT = !!(yt && yt.IN_PLAYABLES_ENV);
 const safe = (fn) => { try { return fn(); } catch (e) { return undefined; } };
 
 // ---------- helpers ----------
-const rnd = (a, b) => a + Math.random() * (b - a);
+// rng drives level layout (seeded in Daily mode); effects use Math.random so layout stays identical.
+let rng = Math.random;
+const rnd = (a, b) => a + rng() * (b - a);
+const frnd = (a, b) => a + Math.random() * (b - a);
+function mulberry32(a) {
+  return () => { a = (a + 0x6D2B79F5) | 0; let x = Math.imul(a ^ (a >>> 15), 1 | a);
+    x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+}
+const dayNum = () => Math.floor(Date.now() / 86400000); // UTC day, same seed for everyone
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, f) => a + (b - a) * f;
 const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
@@ -40,7 +48,8 @@ const FEAT = { 5: 'Moving planets', 10: 'Asteroid belts', 15: 'Gravity wells',
 const themeOf = (i) => THEMES[Math.floor(i / 10) % THEMES.length];
 
 // ---------- save ----------
-const save = { v: 1, best: 0, dust: 0, skins: [0], skin: 0, sound: true, haptics: true };
+const save = { v: 1, best: 0, dust: 0, skins: [0], skin: 0, sound: true, music: true, haptics: true,
+  dailyDay: -1, streak: 0, dailyBest: 0, dailyBestDay: -1 };
 async function loadSave() {
   try {
     let s = '';
@@ -73,12 +82,14 @@ function resize() {
 }
 
 // ---------- audio (generated, no files) ----------
-let actx = null, master = null, noiseBuf = null, sysAudio = true;
+let actx = null, master = null, musicGain = null, noiseBuf = null, sysAudio = true;
 function ensureAudio() {
   if (!actx) {
     try {
       actx = new (window.AudioContext || window.webkitAudioContext)();
       master = actx.createGain(); master.gain.value = 0.8; master.connect(actx.destination);
+      musicGain = actx.createGain(); musicGain.gain.value = save.music ? 1 : 0; musicGain.connect(master);
+      setInterval(musicTick, 150);
       noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.5, actx.sampleRate);
       const d = noiseBuf.getChannelData(0);
       for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
@@ -86,10 +97,13 @@ function ensureAudio() {
   }
   applyAudio();
 }
-const soundOn = () => save.sound && sysAudio && !paused;
+// YouTube mute (sysAudio) and pause always win over the in-game toggles.
+const audioAllowed = () => sysAudio && !paused;
+const soundOn = () => save.sound && audioAllowed();
 function applyAudio() {
   if (!actx) return;
-  if (soundOn()) { if (actx.state === 'suspended') actx.resume().catch(() => {}); }
+  if (musicGain) musicGain.gain.setTargetAtTime(save.music ? 1 : 0, actx.currentTime, 0.1);
+  if (audioAllowed() && (save.sound || save.music)) { if (actx.state === 'suspended') actx.resume().catch(() => {}); }
   else if (actx.state === 'running') actx.suspend().catch(() => {});
 }
 function tone(f, dur, type = 'sine', vol = 0.12, slide = 1, delay = 0) {
@@ -120,6 +134,31 @@ const sfx = {
   warp: () => tone(200, 0.3, 'sine', 0.1, 4),
   deny: () => tone(150, 0.15, 'square', 0.05),
 };
+// Generated ambient music: Am - F - C - G, soft pads + bass + sparse plucks, 16 s loop.
+const CHORDS = [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]];
+const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+let musicNext = 0, musicStep = 0;
+function mnote(m, t0, dur, type, vol, atk) {
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.value = mtof(m);
+  g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(vol, t0 + atk);
+  g.gain.setTargetAtTime(0, t0 + dur - atk, atk / 3);
+  o.connect(g); g.connect(musicGain); o.start(t0); o.stop(t0 + dur + atk);
+}
+function musicTick() {
+  if (!actx || actx.state !== 'running' || !save.music) return;
+  const now = actx.currentTime;
+  if (musicNext < now) musicNext = now + 0.05;
+  while (musicNext < now + 0.6) {
+    const step = musicStep % 8, ch = CHORDS[(musicStep >> 3) % 4], t0 = musicNext;
+    if (step === 0) {
+      for (const m of ch) mnote(m, t0, 4.2, 'triangle', 0.018, 1.2);
+      mnote(ch[0] - 12, t0, 4, 'sine', 0.05, 0.3);
+    }
+    if (Math.random() < 0.6) mnote(ch[(step * 2) % 3] + (Math.random() < 0.3 ? 24 : 12), t0, 0.9, 'sine', 0.022, 0.02);
+    musicNext += 0.5; musicStep++;
+  }
+}
 function buzz(ms) { if (save.haptics && navigator.vibrate) safe(() => navigator.vibrate(ms)); }
 
 // ---------- game state ----------
@@ -128,27 +167,28 @@ let t = 0, last = 0;
 let planets = [], hazards = [], dusts = [], parts = [], floats = [];
 let comet, cur, score = 0, combo = 0, runDust = 0, banked = 0, maxIdx = 0;
 let revived = false, doubled = false, flyT = 0, camY = 0, deathT = 0;
+let mode = 'normal', dailyBonus = 0;
 let banner = null, overAt = 0, shopMsg = null;
 let ui = [], focus = 0, kbd = false;
 let lastAdAt = performance.now(), runsSinceAd = 0, adBusy = false;
 const adsOK = () => IN_YT ? !!(yt.ads && typeof yt.ads.requestRewardedAd === 'function') : true;
 
-const stars = Array.from({ length: 150 }, () => ({ x: Math.random(), y: Math.random(), z: rnd(0.2, 1), s: rnd(0.5, 1.8) }));
+const stars = Array.from({ length: 150 }, () => ({ x: rng(), y: rng(), z: rnd(0.2, 1), s: rnd(0.5, 1.8) }));
 
 function makePlanet(i, prev) {
   const r = clamp(9.5 - i * 0.07, 5.5, 9.5) * rnd(0.9, 1.1);
-  let spin = (1.5 + Math.min(i, 45) * 0.045) * (Math.random() < 0.5 ? 1 : -1);
+  let spin = (1.5 + Math.min(i, 45) * 0.045) * (rng() < 0.5 ? 1 : -1);
   if (i === 0) spin = 1.6;
   const y = prev ? prev.y - (rnd(34, 44) + Math.min(i * 0.25, 10)) : 0;
   let bx = prev ? clamp(prev.bx + rnd(-28, 28), -30, 30) : 0;
   const th = themeOf(i);
-  const p = { idx: i, x: bx, bx, y, r, R: r + 5, spin, rot: Math.random() * 6,
-    hue: th.h[i % 3] + rnd(-12, 12), amp: 0, ms: 0, ph: Math.random() * 6, flip: false, flipT: 0 };
-  if (i >= 5 && Math.random() < 0.4) {
+  const p = { idx: i, x: bx, bx, y, r, R: r + 5, spin, rot: rng() * 6,
+    hue: th.h[i % 3] + rnd(-12, 12), amp: 0, ms: 0, ph: rng() * 6, flip: false, flipT: 0 };
+  if (i >= 5 && rng() < 0.4) {
     p.amp = rnd(8, 16); p.ms = rnd(0.6, 1.2);
     p.bx = clamp(bx, -30 + p.amp, 30 - p.amp); p.x = p.bx;
   }
-  if (i >= 20 && Math.random() < 0.35) p.flip = true;
+  if (i >= 20 && rng() < 0.35) p.flip = true;
   return p;
 }
 
@@ -167,13 +207,13 @@ function addNext() {
   planets.push(p);
   const i = p.idx, my = (prev.y + p.y) / 2;
   for (const f of [0.35, 0.5, 0.65]) {
-    if (Math.random() < 0.7) dusts.push({ x: lerp(prev.bx, p.bx, f) + rnd(-3, 3), y: lerp(prev.y, p.y, f), tw: Math.random() * 6 });
+    if (rng() < 0.7) dusts.push({ x: lerp(prev.bx, p.bx, f) + rnd(-3, 3), y: lerp(prev.y, p.y, f), tw: rng() * 6 });
   }
-  if (i >= 10 && Math.random() < 0.55)
-    hazards.push({ k: 'ast', x: rnd(-50, 50), y: my, vx: rnd(12, 24) * (Math.random() < 0.5 ? 1 : -1), r: rnd(2.2, 3.2), rot: 0 });
-  if (i >= 15 && Math.random() < 0.4) placeAway({ k: 'well', str: 6000, r: 6, rot: 0 }, my, prev, p, 4);
-  if (i >= 25 && Math.random() < 0.3) placeAway({ k: 'hole', str: 9500, r: 3.5, rot: 0 }, my, prev, p, 9);
-  if (i >= 30 && Math.random() < 0.25) {
+  if (i >= 10 && rng() < 0.55)
+    hazards.push({ k: 'ast', x: rnd(-50, 50), y: my, vx: rnd(12, 24) * (rng() < 0.5 ? 1 : -1), r: rnd(2.2, 3.2), rot: 0 });
+  if (i >= 15 && rng() < 0.4) placeAway({ k: 'well', str: 6000, r: 6, rot: 0 }, my, prev, p, 4);
+  if (i >= 25 && rng() < 0.3) placeAway({ k: 'hole', str: 9500, r: 3.5, rot: 0 }, my, prev, p, 9);
+  if (i >= 30 && rng() < 0.25) {
     const a = placeAway({ k: 'worm', r: 3.5, rot: 0 }, my, prev, p, 6);
     if (a) { const b = { k: 'worm', r: 3.5, rot: 0, x: -a.x, y: a.y - 6, to: a }; a.to = b; hazards.push(b); }
   }
@@ -181,7 +221,9 @@ function addNext() {
 
 function attach(p, ang) { cur = p; comet.fly = false; comet.a = ang; }
 
-function reset() {
+function reset(m = 'normal') {
+  mode = m; dailyBonus = 0;
+  rng = m === 'daily' ? mulberry32(Math.imul(dayNum(), 2654435761) ^ 0x5eed) : Math.random;
   planets = []; hazards = []; dusts = []; parts = []; floats = [];
   score = 0; combo = 0; runDust = 0; banked = 0; maxIdx = 0;
   revived = false; doubled = false; flyT = 0; banner = null;
@@ -235,8 +277,8 @@ function capture(p) {
 
 function burst(x, y, c, n, sp) {
   for (let i = 0; i < n; i++) {
-    const a = Math.random() * Math.PI * 2, v = rnd(sp * 0.3, sp);
-    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rnd(0.4, 0.9), max: 0.9, c, s: rnd(0.5, 1.2) });
+    const a = Math.random() * Math.PI * 2, v = frnd(sp * 0.3, sp);
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: frnd(0.4, 0.9), max: 0.9, c, s: frnd(0.5, 1.2) });
   }
 }
 
@@ -250,6 +292,17 @@ function gameOver() {
   state = 'over'; overAt = performance.now(); focus = 0;
   save.dust += runDust - banked; banked = runDust;
   if (score > save.best) save.best = score;
+  if (mode === 'daily') {
+    const today = dayNum();
+    if (save.dailyBestDay !== today) { save.dailyBest = 0; save.dailyBestDay = today; }
+    if (score > save.dailyBest) save.dailyBest = score;
+    if (save.dailyDay !== today) { // first daily run today: streak bonus
+      save.streak = save.dailyDay === today - 1 ? save.streak + 1 : 1;
+      save.dailyDay = today;
+      dailyBonus = 20 + 10 * Math.min(save.streak - 1, 6);
+      save.dust += dailyBonus;
+    }
+  }
   writeSave();
   runsSinceAd++;
   if (IN_YT && score > 0) safe(() => yt.engagement.sendScore({ value: score }));
@@ -469,12 +522,22 @@ function layoutButtons(defs, top) {
   const cols = land ? 2 : 1;
   const bh = clamp(H * 0.085, 40, 58), gap = bh * 0.25;
   const bw = Math.min(land ? W * 0.3 : W * 0.72, 320);
-  const tw = cols * bw + (cols - 1) * gap;
   defs.forEach((d, i) => {
     const c = i % cols, r = (i / cols) | 0;
-    ui.push(Object.assign({ x: W / 2 - tw / 2 + c * (bw + gap), y: top + r * (bh + gap), w: bw, h: bh }, d));
+    const inRow = Math.min(cols, defs.length - r * cols), rw = inRow * bw + (inRow - 1) * gap; // centre a short last row
+    ui.push(Object.assign({ x: W / 2 - rw / 2 + c * (bw + gap), y: top + r * (bh + gap), w: bw, h: bh }, d));
   });
   return top + Math.ceil(defs.length / cols) * (bh + gap);
+}
+
+function layoutRow(defs, top) { // small buttons side by side (settings toggles)
+  const land = W > H * 1.25;
+  const bh = clamp(H * 0.085, 40, 58), gap = bh * 0.25;
+  const tw = land ? Math.min(W * 0.6 + gap, 660) : Math.min(W * 0.72, 320);
+  const bw = (tw - gap * (defs.length - 1)) / defs.length;
+  defs.forEach((d, i) => ui.push(Object.assign({ x: W / 2 - tw / 2 + i * (bw + gap), y: top, w: bw, h: bh,
+    fs: Math.min(bh * 0.3, bw / 5.6) }, d)));
+  return top + bh + gap;
 }
 
 function drawButton(b, f) {
@@ -482,7 +545,7 @@ function drawButton(b, f) {
   ctx.fillStyle = b.disabled ? 'rgba(255,255,255,0.06)' : b.primary ? '#ffb347' : 'rgba(255,255,255,0.14)';
   ctx.fill();
   if (f) { ctx.lineWidth = 3; ctx.strokeStyle = '#fff'; ctx.stroke(); }
-  text(b.label, b.x + b.w / 2, b.y + b.h / 2, b.h * 0.34, b.primary ? '#2a1200' : b.disabled ? 'rgba(255,255,255,0.35)' : '#fff');
+  text(b.label, b.x + b.w / 2, b.y + b.h / 2, b.fs || b.h * 0.34, b.primary ? '#2a1200' : b.disabled ? 'rgba(255,255,255,0.35)' : '#fff');
 }
 
 function drawCard(b, f) {
@@ -512,28 +575,40 @@ function drawUI() {
       text('TAP TO LAUNCH', W / 2, H * 0.86, u * 0.055, '#fff', '800');
       ctx.globalAlpha = 1;
     }
+    if (mode === 'daily') text('DAILY CHALLENGE', W / 2, y + u * 0.12, u * 0.035, '#9fe', '800');
   } else if (state === 'menu') {
     shade(0.35);
-    text('ORBIT HOP', W / 2, H * 0.2, u * 0.12, '#fff', '900');
-    text(`BEST ${save.best}    ✦ ${save.dust}`, W / 2, H * 0.2 + u * 0.1, u * 0.045, '#cfe', '700');
-    layoutButtons([
-      { label: 'PLAY', primary: true, cb: startRun },
+    const today = dayNum(), playedToday = save.dailyDay === today;
+    const streak = playedToday || save.dailyDay === today - 1 ? save.streak : 0;
+    text('ORBIT HOP', W / 2, H * 0.18, u * 0.12, '#fff', '900');
+    text(`BEST ${save.best}    ✦ ${save.dust}`, W / 2, H * 0.18 + u * 0.1, u * 0.045, '#cfe', '700');
+    text(playedToday ? `Daily streak ${streak} · come back tomorrow for more ✦` : streak ? `Daily bonus waiting! Keep your ${streak}-day streak` : 'Daily bonus waiting!',
+      W / 2, H * 0.18 + u * 0.16, u * 0.034, playedToday ? 'rgba(255,255,255,0.6)' : '#ffe680', '700');
+    const y1 = layoutButtons([
+      { label: 'PLAY', primary: true, cb: () => startRun('normal') },
+      { label: 'DAILY CHALLENGE', cb: () => startRun('daily') },
       { label: 'SKINS', cb: () => { state = 'shop'; focus = 0; } },
-      { label: 'SOUND: ' + (save.sound ? 'ON' : 'OFF'), cb: () => { save.sound = !save.sound; applyAudio(); writeSave(); } },
-      { label: 'VIBRATION: ' + (save.haptics ? 'ON' : 'OFF'), cb: () => { save.haptics = !save.haptics; writeSave(); buzz(30); } },
-    ], H * 0.48);
+    ], H * 0.42);
+    layoutRow([
+      { label: 'SFX ' + (save.sound ? 'ON' : 'OFF'), cb: () => { save.sound = !save.sound; applyAudio(); writeSave(); } },
+      { label: 'MUSIC ' + (save.music ? 'ON' : 'OFF'), cb: () => { save.music = !save.music; applyAudio(); writeSave(); } },
+      { label: 'VIBE ' + (save.haptics ? 'ON' : 'OFF'), cb: () => { save.haptics = !save.haptics; writeSave(); buzz(30); } },
+    ], y1);
   } else if (state === 'over') {
     shade(0.6);
     const land = W > H * 1.25;
     const y0 = H * (land ? 0.12 : 0.17);
-    text('GAME OVER', W / 2, y0, u * 0.07, '#ff9a8a', '900');
+    const daily = mode === 'daily';
+    text(daily ? 'DAILY RUN OVER' : 'GAME OVER', W / 2, y0, u * 0.07, '#ff9a8a', '900');
     text(String(score), W / 2, y0 + u * 0.13, u * 0.15, '#fff', '900');
-    text(score >= save.best && score > 0 ? 'NEW BEST!' : 'BEST ' + save.best, W / 2, y0 + u * 0.24, u * 0.045, '#cfe', '700');
-    text('+' + runDust + ' ✦' + (doubled ? '  (DOUBLED)' : ''), W / 2, y0 + u * 0.3, u * 0.045, '#ffe680', '700');
+    text(daily ? "TODAY'S BEST " + save.dailyBest : score >= save.best && score > 0 ? 'NEW BEST!' : 'BEST ' + save.best,
+      W / 2, y0 + u * 0.24, u * 0.045, '#cfe', '700');
+    text('+' + runDust + ' ✦' + (doubled ? '  (DOUBLED)' : '') + (dailyBonus ? `   +${dailyBonus} ✦ daily bonus (streak ${save.streak})` : ''),
+      W / 2, y0 + u * 0.3, u * 0.04, '#ffe680', '700');
     const defs = [];
     if (!revived && adsOK()) defs.push({ label: 'REVIVE  ▶ AD', primary: true, cb: doRevive, disabled: adBusy });
     if (!doubled && runDust > 0 && adsOK()) defs.push({ label: 'DOUBLE ✦  ▶ AD', cb: doDouble, disabled: adBusy });
-    defs.push({ label: 'PLAY AGAIN', primary: defs.length === 0, cb: async () => { await maybeInterstitial(); startRun(); } });
+    defs.push({ label: 'PLAY AGAIN', primary: defs.length === 0, cb: async () => { await maybeInterstitial(); startRun(mode); } });
     defs.push({ label: 'MENU', cb: async () => { await maybeInterstitial(); reset(); state = 'menu'; focus = 0; } });
     layoutButtons(defs, y0 + u * 0.38);
   } else if (state === 'shop') {
@@ -571,7 +646,7 @@ function draw() {
 }
 
 // ---------- actions ----------
-function startRun() { reset(); state = 'play'; focus = 0; }
+function startRun(m) { reset(m); state = 'play'; focus = 0; }
 
 function pickSkin(i) {
   const sk = SKINS[i];
@@ -681,7 +756,5 @@ async function boot() {
   last = performance.now();
   requestAnimationFrame(loop);
 }
-// Local-test hook only (never active inside YouTube).
-if (!IN_YT) window.__oh = { get s() { return { state, score, maxIdx, fly: comet && comet.fly, dust: save.dust, cur: cur && cur.idx }; }, get g() { return { planets, comet, cur, hazards }; } };
 boot();
 })();
